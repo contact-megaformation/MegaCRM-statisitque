@@ -4,7 +4,7 @@
 # + فلترة بالتكوين داخل لوحة الموظّف
 # + إحصائيات شهرية فيها Clients اليوم و Inscrits اليوم
 # + تاريخ ميلاد العميل + تنبيه أعياد الميلاد
-# + تقرير يومي عبر WhatsApp للإدارة مع الملاحظات كاملة
+# + تقرير (بتاريخ من Calendar) عبر WhatsApp للإدارة مع الملاحظات كاملة + التنبيهات
 
 import json, urllib.parse, time
 import streamlit as st
@@ -142,7 +142,7 @@ REASSIGN_LOG_SHEET   = "Reassign_Log"
 REASSIGN_LOG_HEADERS = ["timestamp","moved_by","src_employee","dst_employee","client_name","phone"]
 
 # ============ Helpers ============
-def fmt_date(d: date | None) -> str:
+def fmt_date(d):
     return d.strftime("%d/%m/%Y") if isinstance(d, date) else ""
 
 def normalize_tn_phone(s: str) -> str:
@@ -191,7 +191,7 @@ def get_spreadsheet():
     st.error("تعذر فتح Google Sheet (ربما الكوتا تعدّت).")
     raise last_err
 
-def ensure_ws(title: str, columns: list[str]):
+def ensure_ws(title: str, columns: list):
     sh = get_spreadsheet()
     try:
         ws = sh.worksheet(title)
@@ -225,27 +225,23 @@ def load_all_data():
 
         rows = ws.get_all_values()
         if not rows:
-            # لو الورقة فارغة، نعمل header بالصيغة الجديدة
             ws.update("1:1", [EXPECTED_HEADERS])
             rows = ws.get_all_values()
 
         header_row = rows[0] if rows else []
         data_rows = rows[1:] if len(rows) > 1 else []
-
-        # مابينغ من اسم العمود → index
         header_map = {str(name).strip(): idx for idx, name in enumerate(header_row)}
 
         fixed = []
         for r in data_rows:
             r = list(r or [])
             new_row = []
-            # نركّب صف جديد حسب EXPECTED_HEADERS
             for col_name in EXPECTED_HEADERS:
                 idx = header_map.get(col_name)
                 if idx is not None and idx < len(r):
                     new_row.append(r[idx])
                 else:
-                    new_row.append("")  # لو الكولون موش موجود في النسخة القديمة
+                    new_row.append("")
             fixed.append(new_row)
 
         df = pd.DataFrame(fixed, columns=EXPECTED_HEADERS)
@@ -729,7 +725,7 @@ if role == "موظف" and employee:
                 row_to_append = [
                     nom_emp.strip(),
                     tel_norm,
-                    fmt_date(birthday_emp),  # Date de naissance
+                    fmt_date(birthday_emp),
                     type_contact_emp,
                     formation_emp.strip(),
                     remarque_emp.strip(),
@@ -890,7 +886,9 @@ if role == "موظف" and employee:
                     fmt_date(new_birth),
                 )
                 ws.update_cell(
-                    row_idx, col_map["Formation"], new_formation.strip()
+                    row_idx,
+                    col_map["Formation"],
+                    new_formation.strip()
                 )
                 ws.update_cell(row_idx, col_map["Date ajout"], fmt_date(new_ajout))
                 ws.update_cell(row_idx, col_map["Date de suivi"], fmt_date(new_suivi))
@@ -981,127 +979,139 @@ if role == "موظف" and employee:
     except Exception as e:
         st.warning(f"WhatsApp: {e}")
 
-    # ================== تقرير يومي للإدارة ==================
-    st.markdown("### 📤 تقرير يومي للإدارة (WhatsApp)")
-    try:
-        today = datetime.now().date()
+    # ================== 📤 تقرير للإدارة (WhatsApp) + Calendar ==================
+    st.markdown("### 📤 تقرير للإدارة (WhatsApp)")
 
-        df_emp_daily = df_emp_raw.copy()
-        df_emp_daily["DateAjout_dt"] = pd.to_datetime(
-            df_emp_daily["Date ajout"], dayfirst=True, errors="coerce"
-        )
-        df_emp_daily["DateSuivi_dt"] = pd.to_datetime(
-            df_emp_daily["Date de suivi"], dayfirst=True, errors="coerce"
-        )
+    def safe_str(x):
+        return str(x).strip() if x is not None else ""
 
-        # العملاء المضافين اليوم
-        today_rows = df_emp_daily[
-            df_emp_daily["DateAjout_dt"].dt.date == today
-        ].copy()
-        total_today = len(today_rows)
+    def is_nonempty(x) -> bool:
+        return bool(safe_str(x))
 
-        inscrits_today = int(
-            today_rows["Inscription"]
+    def build_admin_report_for_date(df_source: pd.DataFrame, employee: str, target_date: date) -> str:
+        """
+        تقرير بتاريخ يختارو المستخدم:
+        - عدد العملاء المضافين اليوم (في target_date)
+        - عدد المسجلين اليوم (من المضافين في target_date)
+        - عدد العملاء مع تنبيهات (Alerte_view/Alerte غير فارغة + Date de suivi = target_date)
+        - تفصيل حسب التكوين (للمضافين في target_date)
+        + قائمة التواصُل في target_date مع الملاحظات كاملة (قديمة ولا جديدة) + نوع التواصل + التنبيه إن وجد
+        """
+
+        d = df_source.copy()
+
+        d["DateAjout_dt"] = pd.to_datetime(d.get("Date ajout", ""), dayfirst=True, errors="coerce")
+        d["DateSuivi_dt"] = pd.to_datetime(d.get("Date de suivi", ""), dayfirst=True, errors="coerce")
+
+        if "Alerte_view" in d.columns:
+            d["Alerte_eff"] = d["Alerte_view"].fillna("").astype(str).str.strip()
+        else:
+            d["Alerte_eff"] = d.get("Alerte", "").fillna("").astype(str).str.strip()
+
+        d["Inscription_norm"] = (
+            d.get("Inscription", "")
             .fillna("")
-            .astype(str)
-            .str.strip()
-            .str.lower()
-            .isin(["oui", "inscrit"])
-            .sum()
+            .astype(str).str.strip().str.lower()
         )
 
-        alerts_today = int(
-            today_rows.get("Alerte_view", today_rows.get("Alerte", ""))
-            .fillna("")
-            .astype(str)
-            .str.strip()
-            .ne("")
-            .sum()
-        )
+        # مجموعات حسب التاريخ
+        added_rows = d[d["DateAjout_dt"].dt.date == target_date].copy()
+        contacts_rows = d[d["DateSuivi_dt"].dt.date == target_date].copy()
+        alerts_rows = contacts_rows[contacts_rows["Alerte_eff"].apply(is_nonempty)].copy()
 
-        # العملاء اللي عندهم متابعة/تواصل اليوم
-        contacts_today = df_emp_daily[
-            df_emp_daily["DateSuivi_dt"].dt.date == today
-        ].copy()
+        # Counters
+        total_added = int(len(added_rows))
+        total_inscrits = int(added_rows["Inscription_norm"].isin(["oui", "inscrit"]).sum())
+        total_alerts = int(len(alerts_rows))
 
-        # تفصيل حسب التكوين للعملاء المضافين اليوم
-        if not today_rows.empty:
+        # تفصيل حسب التكوين (للمضافين)
+        if not added_rows.empty:
             by_form = (
-                today_rows.groupby("Formation")["Nom & Prénom"]
+                added_rows.groupby(added_rows.get("Formation", "").fillna("").astype(str).str.strip())
+                ["Nom & Prénom"]
                 .count()
-                .reset_index()
+                .sort_values(ascending=False)
             )
         else:
-            by_form = pd.DataFrame(columns=["Formation", "Nom & Prénom"])
+            by_form = pd.Series(dtype=int)
 
-        lines = [
-            f"تقرير يومي لموظف: {employee}",
-            f"التاريخ: {today.strftime('%d/%m/%Y')}",
-            "",
-            f"- عدد العملاء المضافين اليوم: {total_today}",
-            f"- عدد المسجلين اليوم: {inscrits_today}",
-            f"- عدد العملاء مع تنبيهات: {alerts_today}",
-        ]
+        # نص التقرير
+        lines = []
+        lines.append(f"📌 تقرير يوم: {target_date.strftime('%d/%m/%Y')}")
+        lines.append(f"👤 الموظّف: {employee}")
+        lines.append("")
+        lines.append(f"- عدد العملاء المضافين اليوم: {total_added}")
+        lines.append(f"- عدد المسجلين اليوم: {total_inscrits}")
+        lines.append(f"- عدد العملاء مع تنبيهات: {total_alerts}")
 
-        if not by_form.empty:
-            lines.append("")
-            lines.append("تفصيل حسب التكوين:")
-            for _, r in by_form.iterrows():
-                lines.append(f"• {r['Formation']}: {int(r['Nom & Prénom'])} عميل")
+        lines.append("")
+        lines.append("تفصيل حسب التكوين:")
+        if len(by_form) == 0:
+            lines.append("• لا يوجد")
+        else:
+            for form_name, cnt in by_form.items():
+                fn = safe_str(form_name) or "(بدون تكوين)"
+                lines.append(f"• {fn}: {int(cnt)}")
 
-        # العملاء المضافون اليوم + ملاحظاتهم (كاملة)
-        if not today_rows.empty:
-            lines.append("")
-            lines.append("العملاء المضافون اليوم (مع الملاحظات):")
-            for _, r in today_rows.iterrows():
-                name = str(r.get("Nom & Prénom", "")).strip()
-                phone = str(r.get("Téléphone", "")).strip()
-                form = str(r.get("Formation", "")).strip()
-                note = str(r.get("Remarque", "")).strip()
-
-                line = f"- {name} ({form}) — {phone}"
-                if note:
-                    line += f"\n  ملاحظات: {note}"
-
-                lines.append(line)
-
-        # العملاء اللي صار معاهم تواصل اليوم (Date de suivi = اليوم) + ملاحظاتهم
-        if not contacts_today.empty:
-            lines.append("")
-            lines.append("العملاء اللي صار معاهم تواصل اليوم (متابعة):")
-            for _, r in contacts_today.iterrows():
-                name = str(r.get("Nom & Prénom", "")).strip()
-                phone = str(r.get("Téléphone", "")).strip()
-                form = str(r.get("Formation", "")).strip()
-                t_contact = str(r.get("Type de contact", "")).strip()
-                note = str(r.get("Remarque", "")).strip()
+        # أي رقم "تواصلتو معاه" = Date de suivi = target_date
+        lines.append("")
+        lines.append("📞 قائمة العملاء اللي صار معاهم تواصل اليوم (مع الملاحظات):")
+        if contacts_rows.empty:
+            lines.append("• لا يوجد تواصلات اليوم")
+        else:
+            for _, r in contacts_rows.sort_values("Nom & Prénom", na_position="last").iterrows():
+                name = safe_str(r.get("Nom & Prénom", ""))
+                phone = safe_str(r.get("Téléphone", ""))
+                form = safe_str(r.get("Formation", ""))
+                t_contact = safe_str(r.get("Type de contact", ""))
+                note = safe_str(r.get("Remarque", ""))
+                alert_txt = safe_str(r.get("Alerte_eff", ""))
 
                 line = f"- {name} ({form}) — {phone}"
                 if t_contact:
                     line += f" | نوع التواصل: {t_contact}"
+                if alert_txt:
+                    line += f"\n  🚨 تنبيه: {alert_txt}"
                 if note:
-                    line += f"\n  ملاحظات: {note}"
+                    line += f"\n  📝 ملاحظات: {note}"
+                else:
+                    line += f"\n  📝 ملاحظات: (لا يوجد)"
 
                 lines.append(line)
 
-        report_text = "\n".join(lines)
+        lines.append("")
+        lines.append("🚨 قائمة التنبيهات اليوم (مع الملاحظات):")
+        if alerts_rows.empty:
+            lines.append("• لا يوجد تنبيهات اليوم")
+        else:
+            for _, r in alerts_rows.sort_values("Nom & Prénom", na_position="last").iterrows():
+                name = safe_str(r.get("Nom & Prénom", ""))
+                phone = safe_str(r.get("Téléphone", ""))
+                form = safe_str(r.get("Formation", ""))
+                alert_txt = safe_str(r.get("Alerte_eff", ""))
+                note = safe_str(r.get("Remarque", ""))
 
-        st.text_area(
-            "معاينة التقرير الذي سيُرسل", value=report_text, height=260
-        )
+                line = f"- {name} ({form}) — {phone}\n  🚨 {alert_txt}"
+                if note:
+                    line += f"\n  📝 ملاحظات: {note}"
+                else:
+                    line += f"\n  📝 ملاحظات: (لا يوجد)"
+                lines.append(line)
 
-        if st.button("📲 إرسال تقرير اليوم إلى 22423590 عبر WhatsApp"):
-            wa_admin_number = "21622423590"
-            url = (
-                f"https://wa.me/{wa_admin_number}?text="
-                f"{urllib.parse.quote(report_text)}"
-            )
-            st.markdown(f"[اضغط هنا لإرسال التقرير عبر WhatsApp]({url})")
-            st.info(
-                "إضغط على الرابط، يتفتحلك WhatsApp Web / التطبيق وتبعث التقرير."
-            )
+        return "\n".join(lines)
+
+    try:
+        report_date = st.date_input("📅 اختر تاريخ التقرير", value=date.today())
+        report_text = build_admin_report_for_date(df_emp_raw, employee, report_date)
+
+        st.text_area("معاينة التقرير الذي سيُرسل", value=report_text, height=340)
+
+        wa_admin_number = "21622423590"
+        wa_url = f"https://wa.me/{wa_admin_number}?text={urllib.parse.quote(report_text)}"
+        st.markdown(f"[📲 إرسال التقرير عبر WhatsApp]({wa_url})")
+        st.caption("اضغط على الرابط → يفتح WhatsApp Web / التطبيق والتقرير جاهز للإرسال.")
     except Exception as e:
-        st.warning(f"تعذر تجهيز التقرير اليومي: {e}")
+        st.warning(f"تعذر تجهيز التقرير: {e}")
 
     # ================== نقل عميل بين الموظفين ==================
     st.markdown("### 🔁 نقل عميل بين الموظفين")
