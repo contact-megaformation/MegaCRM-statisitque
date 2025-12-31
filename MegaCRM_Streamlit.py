@@ -5,6 +5,7 @@
 # + إحصائيات شهرية فيها Clients اليوم و Inscrits اليوم
 # + تاريخ ميلاد العميل + تنبيه أعياد الميلاد
 # + تقرير (Calendar) عبر WhatsApp للإدارة مع الملاحظات كاملة + التنبيهات
+# + قيد تاريخ المتابعة: لا يتجاوز اليوم + 5 أيام (للـموظف وللأدمِن)
 
 import json, urllib.parse, time
 import streamlit as st
@@ -101,6 +102,9 @@ with st.sidebar:
         """,
         unsafe_allow_html=True,
     )
+
+# ================== قيد تاريخ المتابعة ==================
+FOLLOWUP_MAX_DAYS = 5  # ✅ اليوم + 5 أيام
 
 # ============ Google Auth ============
 SCOPE = ["https://www.googleapis.com/auth/spreadsheets"]
@@ -213,7 +217,6 @@ def load_all_data():
     for ws in sh.worksheets():
         title = ws.title.strip()
 
-        # نستثني أوراق المداخيل والأنظمة الداخلية
         if title.endswith("_PAIEMENTS"):
             continue
         if title.startswith("_"):
@@ -446,7 +449,6 @@ if not df_all.empty and "DateAjout_dt" in df_all.columns:
 
         cols_order = ["الموظف","Clients","Clients اليوم","Inscrits اليوم","Inscrits","% تسجيل","Alerts"]
         grp_emp = grp_emp[[c for c in cols_order if c in grp_emp.columns]]
-
         st.dataframe(grp_emp.sort_values(["Inscrits", "Clients"], ascending=False), use_container_width=True)
 
 # ============ بحث عام برقم الهاتف ============
@@ -491,16 +493,13 @@ if role == "موظف" and employee:
             today = datetime.now().date()
             bday_mask = df_birth["Birth_dt"].dt.month.eq(today.month) & df_birth["Birth_dt"].dt.day.eq(today.day)
             bday_df = df_birth[bday_mask]
-
             if not bday_df.empty:
                 st.markdown("### 🎂 تنبيهات أعياد الميلاد اليوم")
                 for _, row in bday_df.iterrows():
                     name = str(row.get("Nom & Prénom", "")).strip()
                     phone_norm = normalize_tn_phone(row.get("Téléphone", ""))
                     phone_display = format_display_phone(phone_norm)
-
                     st.success(f"اليوم عيد ميلاد: **{name}** — {phone_display}")
-
                     default_msg = f"🎂 عيد ميلاد سعيد {name}! كامل فريق Mega Formation يتمنّى لك سنة مليانة نجاح وتوفيق 🤍"
                     if phone_norm:
                         wa_url = f"https://wa.me/{phone_norm}?text={urllib.parse.quote(default_msg)}"
@@ -555,6 +554,8 @@ if role == "موظف" and employee:
 
     # ================== ➕ أضف عميل جديد (للموظّف) ==================
     st.markdown("### ➕ أضف عميل جديد")
+    max_suivi = date.today() + timedelta(days=FOLLOWUP_MAX_DAYS)
+
     with st.form(f"emp_add_client_form::{employee}"):
         col1, col2 = st.columns(2)
         with col1:
@@ -570,13 +571,26 @@ if role == "موظف" and employee:
             )
             birthday_emp = st.date_input("🎂 تاريخ الميلاد", key=f"emp_add_birth::{employee}")
             date_ajout_emp = st.date_input("🕓 تاريخ الإضافة", value=date.today(), key=f"emp_add_dt_add::{employee}")
-            date_suivi_emp = st.date_input("📆 تاريخ المتابعة", value=date.today(), key=f"emp_add_dt_suivi::{employee}")
+
+            # ✅ قيد تاريخ المتابعة (اليوم .. اليوم+5)
+            date_suivi_emp = st.date_input(
+                "📆 تاريخ المتابعة",
+                value=date.today(),
+                min_value=date.today(),
+                max_value=max_suivi,
+                key=f"emp_add_dt_suivi::{employee}",
+            )
 
         remarque_emp = st.text_area("🗒️ ملاحظة (اختياري)", key=f"emp_add_rem::{employee}")
         submitted_add_emp = st.form_submit_button("📥 أضف العميل")
 
     if submitted_add_emp:
         try:
+            # ✅ حماية إضافية
+            if date_suivi_emp > (date.today() + timedelta(days=FOLLOWUP_MAX_DAYS)):
+                st.error("⛔ لازم التاريخ مايفوتش تاريخ ليوم +5 أيام.")
+                st.stop()
+
             tel_norm = normalize_tn_phone(tel_emp)
             if not (nom_emp and tel_norm and formation_emp):
                 st.error("❌ حقول أساسية ناقصة (الاسم، الهاتف، التكوين).")
@@ -626,6 +640,8 @@ if role == "موظف" and employee:
         chosen_phone = options[chosen_key]
         cur_row = df_emp_edit[df_emp_edit["Téléphone_norm"] == chosen_phone].iloc[0]
 
+        max_suivi_edit = date.today() + timedelta(days=FOLLOWUP_MAX_DAYS)
+
         with st.form(f"edit_client_form::{employee}"):
             col1, col2 = st.columns(2)
             with col1:
@@ -643,17 +659,23 @@ if role == "موظف" and employee:
 
                 new_ajout = st.date_input(
                     "🕓 تاريخ الإضافة",
-                    value=pd.to_datetime(cur_row["Date ajout"], dayfirst=True, errors="coerce").date()
+                    value=pd.to_datetime(cur_row.get("Date ajout",""), dayfirst=True, errors="coerce").date()
                     if str(cur_row.get("Date ajout","")).strip() else date.today()
                 )
 
+                # ✅ قيد تاريخ المتابعة (اليوم .. اليوم+5)
+                cur_suivi_raw = str(cur_row.get("Date de suivi","")).strip()
+                if cur_suivi_raw:
+                    dt_s = pd.to_datetime(cur_suivi_raw, dayfirst=True, errors="coerce")
+                    default_suivi = dt_s.date() if pd.notna(dt_s) else date.today()
+                else:
+                    default_suivi = date.today()
+
                 new_suivi = st.date_input(
                     "📆 تاريخ المتابعة",
-                    value=(
-                        pd.to_datetime(cur_row["Date de suivi"], dayfirst=True, errors="coerce").date()
-                        if str(cur_row.get("Date de suivi","")).strip()
-                        else date.today()
-                    ),
+                    value=default_suivi,
+                    min_value=date.today(),
+                    max_value=max_suivi_edit,
                 )
 
                 new_insc = st.selectbox(
@@ -667,6 +689,11 @@ if role == "موظف" and employee:
 
         if submitted:
             try:
+                # ✅ حماية إضافية
+                if new_suivi > (date.today() + timedelta(days=FOLLOWUP_MAX_DAYS)):
+                    st.error("⛔ لازم التاريخ مايفوتش تاريخ ليوم +5 أيام.")
+                    st.stop()
+
                 ws = get_spreadsheet().worksheet(employee)
                 values = ws.get_all_values()
                 header = values[0] if values else []
@@ -727,8 +754,6 @@ if role == "موظف" and employee:
         [f"{r['Nom & Prénom']} — {format_display_phone(normalize_tn_phone(r['Téléphone']))}" for _, r in scope_df.iterrows()],
         key="tag_select",
     )
-
-    # نجيب الهاتف من آخر جزء بعد —
     raw_tel_part = tel_key2.split("—")[-1]
     tel_color = normalize_tn_phone(raw_tel_part)
 
@@ -778,7 +803,6 @@ if role == "موظف" and employee:
     # ================== تقرير للإدارة (WhatsApp) + Calendar ==================
     st.markdown("### 📤 تقرير للإدارة (WhatsApp)")
 
-    # ✅ هذه هي الكلندريا (Calendar)
     report_date = st.date_input("📅 اختر تاريخ التقرير", value=date.today())
     st.caption(f"التقرير هذا بتاريخ: {report_date.strftime('%d/%m/%Y')}")
 
@@ -787,11 +811,9 @@ if role == "موظف" and employee:
 
     def build_admin_report_for_date(df_source: pd.DataFrame, employee_name: str, target_date: date) -> str:
         d = df_source.copy()
-
         d["DateAjout_dt"] = pd.to_datetime(d.get("Date ajout", ""), dayfirst=True, errors="coerce")
         d["DateSuivi_dt"] = pd.to_datetime(d.get("Date de suivi", ""), dayfirst=True, errors="coerce")
 
-        # Alerte effective
         if "Alerte_view" in d.columns:
             d["Alerte_eff"] = d["Alerte_view"].fillna("").astype(str).str.strip()
         else:
@@ -807,7 +829,6 @@ if role == "موظف" and employee:
         total_inscrits = int(added_rows["Inscription_norm"].isin(["oui", "inscrit"]).sum())
         total_alerts = int(len(alerts_rows))
 
-        # تفصيل حسب التكوين (للمضافين)
         if not added_rows.empty:
             by_form = (
                 added_rows.groupby(added_rows.get("Formation", "").fillna("").astype(str).str.strip())["Nom & Prénom"]
@@ -1089,6 +1110,9 @@ if role == "أدمن":
             st.subheader("➕ إضافة عميل (لأي موظّف)")
             sh = get_spreadsheet()
             target_emp = st.selectbox("اختر الموظّف", all_employes, key="admin_add_emp")
+
+            max_suivi_admin = date.today() + timedelta(days=FOLLOWUP_MAX_DAYS)
+
             with st.form("admin_add_client_form"):
                 nom_a = st.text_input("👤 الاسم و اللقب")
                 tel_a = st.text_input("📞 الهاتف")
@@ -1097,15 +1121,29 @@ if role == "أدمن":
                 type_contact_a = st.selectbox("نوع التواصل", ["Visiteur", "Appel téléphonique", "WhatsApp", "Social media"])
                 inscription_a = st.selectbox("التسجيل", ["Pas encore", "Inscrit"])
                 date_ajout_a = st.date_input("تاريخ الإضافة", value=date.today())
-                suivi_date_a = st.date_input("تاريخ المتابعة", value=date.today())
+
+                # ✅ قيد تاريخ المتابعة (اليوم .. اليوم+5)
+                suivi_date_a = st.date_input(
+                    "تاريخ المتابعة",
+                    value=date.today(),
+                    min_value=date.today(),
+                    max_value=max_suivi_admin,
+                )
+
                 remarque_a = st.text_area("🗒️ ملاحظة (اختياري)")
                 sub_admin = st.form_submit_button("📥 أضف")
 
             if sub_admin:
                 try:
+                    # ✅ حماية إضافية
+                    if suivi_date_a > (date.today() + timedelta(days=FOLLOWUP_MAX_DAYS)):
+                        st.error("⛔ لازم التاريخ مايفوتش تاريخ ليوم +5 أيام.")
+                        st.stop()
+
                     if not (nom_a and tel_a and formation_a and target_emp):
                         st.error("❌ حقول ناقصة.")
                         st.stop()
+
                     tel_norm = normalize_tn_phone(tel_a)
                     if tel_norm in set(df_all.get("Téléphone_norm", pd.Series(dtype=str))):
                         st.warning("⚠️ الرقم موجود.")
